@@ -1,0 +1,154 @@
+name: BECT75 Rackula Production Health
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - production-release.json
+      - .github/workflows/production-health.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rackula-production-health
+  cancel-in-progress: true
+
+jobs:
+  health:
+    name: Verify production health and release identity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      production_url: ${{ steps.contract.outputs.production_url }}
+      release: ${{ steps.contract.outputs.release }}
+      application_version: ${{ steps.contract.outputs.application_version }}
+      source_commit: ${{ steps.contract.outputs.source_commit }}
+    steps:
+      - name: Checkout production control repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Read production contract
+        id: contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const fs = require('fs');
+          const release = JSON.parse(fs.readFileSync('production-release.json', 'utf8'));
+          for (const key of ['release', 'applicationVersion', 'sourceRepository', 'sourceCommit', 'productionUrl']) {
+            if (!release[key]) throw new Error(`missing ${key}`);
+          }
+          if (release.sourceRepository !== 'BECT75/rackula') throw new Error(`unexpected sourceRepository ${release.sourceRepository}`);
+          if (!/^[0-9a-f]{40}$/.test(release.sourceCommit)) throw new Error('sourceCommit must be a full immutable commit SHA');
+          if (release.productionUrl !== 'https://bect75.github.io/rackula-prod/') throw new Error(`unexpected productionUrl ${release.productionUrl}`);
+          console.log(`release=${release.release}`);
+          console.log(`application_version=${release.applicationVersion}`);
+          console.log(`source_commit=${release.sourceCommit}`);
+          console.log(`production_url=${release.productionUrl}`);
+          NODE
+
+      - name: Probe production endpoints and identity
+        shell: bash
+        env:
+          BASE_URL: ${{ steps.contract.outputs.production_url }}
+          EXPECTED_RELEASE: ${{ steps.contract.outputs.release }}
+          EXPECTED_VERSION: ${{ steps.contract.outputs.application_version }}
+          EXPECTED_COMMIT: ${{ steps.contract.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          retry_curl() {
+            curl --fail --silent --show-error --location --retry 12 --retry-delay 5 --retry-all-errors \
+              --connect-timeout 10 --max-time 30 "$1"
+          }
+
+          html="$(retry_curl "$BASE_URL")"
+          login="$(retry_curl "${BASE_URL}login.html")"
+          version="$(retry_curl "${BASE_URL}version.json")"
+          config="$(retry_curl "${BASE_URL}config.js")"
+
+          printf '%s' "$html" | grep -Fq 'Rackula - Rack Layout Designer'
+          printf '%s' "$login" | grep -Eiq '(Rackula|login|sign in)'
+          printf '%s' "$config" | grep -Eq 'storage:[[:space:]]*"browser"'
+
+          VERSION_JSON="$version" EXPECTED_VERSION="$EXPECTED_VERSION" EXPECTED_COMMIT="$EXPECTED_COMMIT" node <<'NODE'
+          const payload = JSON.parse(process.env.VERSION_JSON);
+          const expectedVersion = process.env.EXPECTED_VERSION;
+          const expectedCommit = process.env.EXPECTED_COMMIT;
+          if (payload.version !== expectedVersion) {
+            throw new Error(`version mismatch: expected ${expectedVersion}, got ${payload.version}`);
+          }
+          if (!payload.commit || !expectedCommit.startsWith(payload.commit)) {
+            throw new Error(`commit mismatch: expected prefix of ${expectedCommit}, got ${payload.commit}`);
+          }
+          NODE
+
+          curl --fail --silent --show-error --head --location --retry 12 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 10 --max-time 30 "$BASE_URL" >/dev/null
+
+          {
+            echo "## RACKULA production health — PASS"
+            echo
+            echo "- Release: \`$EXPECTED_RELEASE\`"
+            echo "- Application: \`$EXPECTED_VERSION\`"
+            echo "- Source: \`$EXPECTED_COMMIT\`"
+            echo "- URL: $BASE_URL"
+            echo "- Checked at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  incident:
+    name: Open or update production incident
+    needs: health
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Record failed health check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="[PRODUCTION] RACKULA health check failed"
+          existing="$(gh issue list --repo "$REPO" --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          body="Automated post-release production health check failed.\n\nRun: $RUN_URL\n\nProduction must be treated as degraded until a successful health check is recorded."
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+  recovery:
+    name: Close recovered production incident
+    needs: health
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Record recovery when an automated incident is open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="[PRODUCTION] RACKULA health check failed"
+          existing="$(gh issue list --repo "$REPO" --state open --search "$title in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "Production health check recovered successfully.\n\nRun: $RUN_URL"
+            gh issue close "$existing" --repo "$REPO" --reason completed
+          fi
